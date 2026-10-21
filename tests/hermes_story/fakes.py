@@ -11,6 +11,8 @@ from pydantic import Field
 from interfaces.image_output import ImageOutput
 from interfaces.video_output import VideoOutput
 
+from hermes_story import guarded
+
 
 class FakeImageGen:
     """Returns a tiny landscape PIL image and records every call."""
@@ -39,23 +41,35 @@ class FakeImageGen:
 
 
 class FakeVideoGen:
-    """Returns an ``mp4`` byte output and records every call."""
+    """Returns an ``mp4`` byte output and records every call.
+
+    ``item`` is read from :data:`hermes_story.guarded.CURRENT_ITEM`, and
+    ``max_concurrent`` tracks how many calls were ever in flight at once.
+    """
 
     def __init__(self, raise_exc: BaseException | None = None) -> None:
         self.raise_exc = raise_exc
         self.calls: list[dict] = []
+        self.in_flight = 0
+        self.max_concurrent = 0
 
     async def generate_single_video(self, prompt="", reference_image_paths=None, **kwargs):
         self.calls.append(
             {
+                "item": guarded.current_item(),
                 "prompt": prompt,
                 "reference_image_paths": list(reference_image_paths or []),
                 **kwargs,
             }
         )
-        if self.raise_exc is not None:
-            raise self.raise_exc
-        return VideoOutput(fmt="bytes", ext="mp4", data=b"mp4")
+        self.in_flight += 1
+        self.max_concurrent = max(self.max_concurrent, self.in_flight)
+        try:
+            if self.raise_exc is not None:
+                raise self.raise_exc
+            return VideoOutput(fmt="bytes", ext="mp4", data=b"mp4")
+        finally:
+            self.in_flight -= 1
 
 
 class FakeChat(FakeListChatModel):

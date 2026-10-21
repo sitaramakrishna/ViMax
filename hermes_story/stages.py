@@ -50,6 +50,15 @@ class StageResult:
     errors: list[str] = field(default_factory=list)
 
 
+class StageStopped(Exception):
+    """A stage stopped early but keeps the items it already produced."""
+
+    def __init__(self, rows: list[dict], error: str) -> None:
+        self.rows = rows
+        self.error = error
+        super().__init__(error)
+
+
 def user_requirement(bible_data: dict, for_stage: str) -> str:
     """The requirement text handed to ViMax, built from the film's options."""
     options = bible_data.get("options") or {}
@@ -253,6 +262,19 @@ def _frame_rows(engine, scene: int | None = None) -> list[dict]:
                 paths.append(last)
             row = _row(engine, f"frame:{i}.{j}", "", paths=tuple(paths))
             row["kind"] = "image"
+            rows.append(row)
+    return rows
+
+
+def _clip_rows(engine) -> list[dict]:
+    rows = []
+    for i in _scene_indexes(engine):
+        for j in _shot_indexes(engine, i):
+            video = _work(engine) / f"scene_{i}" / "shots" / str(j) / "video.mp4"
+            if not video.is_file():
+                continue
+            row = _row(engine, f"clip:{i}.{j}", "", paths=(video,))
+            row["kind"] = "video"
             rows.append(row)
     return rows
 
@@ -543,6 +565,67 @@ async def _frames(engine) -> list[dict]:
     return rows
 
 
+async def _clips(engine) -> list[dict]:
+    characters = _load_characters(engine)
+    requirement = user_requirement(bible.load(engine.pid), "clips")
+    price = engine.video.price_per_s * engine.video.duration_s
+
+    rows: list[dict] = []
+    for scene, text in enumerate(_load_script(engine)):
+        pipeline = engine.scene(scene)
+        storyboard = await pipeline.design_storyboard(
+            script=text,
+            characters=characters,
+            user_requirement=requirement,
+            quiet=True,
+        )
+        shot_descriptions = await pipeline.decompose_visual_descriptions(
+            shot_brief_descriptions=storyboard,
+            characters=characters,
+            quiet=True,
+        )
+
+        # One shot at a time, so the cap is checked against settled spend.
+        for shot in sorted(shot_descriptions, key=lambda description: description.idx):
+            item = f"clip:{scene}.{shot.idx}"
+            folder = _work(engine) / f"scene_{scene}" / "shots" / str(shot.idx)
+            existing = folder / "video.mp4"
+            if existing.is_file():
+                row = _row(engine, item, "", paths=(existing,))
+                row["kind"] = "video"
+                rows.append(row)
+                continue
+            if engine.ledger.spent() + price > engine.ledger.cap + 1e-9:
+                raise StageStopped(rows, f"cap reached before {item}")
+
+            first_path = folder / "first_frame.png"
+            last_path = folder / "last_frame.png"
+            needs_last = shot.variation_type in ("medium", "large")
+            if not first_path.is_file() or (needs_last and not last_path.is_file()):
+                row = _row(engine, item, "")
+                row["kind"] = "video"
+                row["_error"] = f"frame missing for {item}"
+                rows.append(row)
+                continue
+
+            events = pipeline.frame_events.setdefault(
+                shot.idx, {"first_frame": asyncio.Event()}
+            )
+            events["first_frame"].set()
+            if needs_last:
+                events.setdefault("last_frame", asyncio.Event()).set()
+
+            with guarded.item(item):
+                await pipeline.generate_video_for_single_shot(shot_description=shot)
+
+            video_path = folder / "video.mp4"
+            if video_path.is_file():
+                row = _row(engine, item, "", paths=(video_path,))
+                row["kind"] = "video"
+                rows.append(row)
+    return rows
+
+
 _STAGES = {
     "script": _script,
     "characters": _characters,
@@ -550,6 +633,7 @@ _STAGES = {
     "storyboard": _storyboard,
     "prompts": _prompts,
     "frames": _frames,
+    "clips": _clips,
 }
 
 _READERS = {
@@ -559,6 +643,7 @@ _READERS = {
     "storyboard": _storyboard_rows,
     "prompts": _prompt_rows,
     "frames": _frame_rows,
+    "clips": _clip_rows,
 }
 
 
@@ -610,6 +695,10 @@ async def run_stage(engine, stage: str) -> StageResult:
     state.set_stage(pid, stage, "running")
     try:
         rows = await run(engine)
+    except StageStopped as stop:
+        errors = _finish(engine, stage, stop.rows)
+        errors.append(stop.error)
+        return StageResult(stage, stop.rows, engine.ledger.spent() - spent_before, errors)
     except Exception as exc:
         message = str(exc) or type(exc).__name__
         state.set_stage(pid, stage, "failed", message)

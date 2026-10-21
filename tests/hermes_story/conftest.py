@@ -72,3 +72,11 @@ def eng_after_sheets(eng_after_text):
     _run(eng_after_text, "sheets")
     _approve(eng_after_text.pid, "sheets")
     return eng_after_text
+
+
+@pytest.fixture
+def eng_after_frames(eng_after_sheets):
+    """``eng_after_sheets`` plus generated and approved first frames."""
+    _run(eng_after_sheets, "frames")
+    _approve(eng_after_sheets.pid, "frames")
+    return eng_after_sheets
