@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+
 from PIL import Image
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from pydantic import Field
 
 from interfaces.image_output import ImageOutput
 from interfaces.video_output import VideoOutput
@@ -52,5 +55,143 @@ class FakeVideoGen:
 class FakeChat(FakeListChatModel):
     """A queued-response chat model usable with ``chat_model | parser``."""
 
+    #: Every message list handed to the model, oldest first.
+    calls: list = Field(default_factory=list)
+
     def __init__(self, responses: list[str] | None = None, **kwargs) -> None:
         super().__init__(responses=list(responses or ["ok"]), **kwargs)
+
+    def _call(self, messages, stop=None, run_manager=None, **kwargs):
+        self.calls.append(messages)
+        return super()._call(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+class canned:
+    """Canned model replies in the exact shapes ViMax's parsers expect.
+
+    The film is fixed so later tests can rely on it: two scenes, two visible
+    characters (``Ana`` and ``Bolt``), and one shot per scene.
+    """
+
+    STORY = (
+        "A robot learns to paint.\n\n"
+        "Scene 1: Ana switches on a rusty robot in her studio.\n"
+        "Scene 2: Bolt finishes its first painting and shows Ana."
+    )
+
+    SCENE_0 = (
+        "INT. STUDIO - DAY\n\n"
+        "ANA (30s, paint-stained apron) wipes dust off an old robot. "
+        "She flips its switch and steps back."
+    )
+    SCENE_1 = (
+        "INT. STUDIO - LATER\n\n"
+        "BOLT (a boxy rusted robot) holds up a canvas covered in blue strokes. "
+        "Ana claps."
+    )
+
+    SCRIPT = json.dumps({"script": [SCENE_0, SCENE_1]})
+
+    CHARACTERS = json.dumps(
+        {
+            "characters": [
+                {
+                    "idx": 0,
+                    "identifier_in_scene": "Ana",
+                    "is_visible": True,
+                    "static_features": "Ana has short dark hair, brown eyes and a lean build.",
+                    "dynamic_features": "Wearing a paint-stained denim apron over a grey shirt.",
+                },
+                {
+                    "idx": 1,
+                    "identifier_in_scene": "Bolt",
+                    "is_visible": True,
+                    "static_features": "Bolt is a boxy rusted robot with round amber eyes.",
+                    "dynamic_features": "Wearing a chipped blue shoulder plate.",
+                },
+            ]
+        }
+    )
+
+    STORYBOARD_0 = json.dumps(
+        {
+            "storyboard": [
+                {
+                    "idx": 0,
+                    "is_last": True,
+                    "cam_idx": 0,
+                    "visual_desc": (
+                        "Wide shot of the cluttered studio at eye level. "
+                        "<Ana> stands on the left, facing right, one hand on the "
+                        "robot's dusty shoulder. Cool window light falls across "
+                        "the workbench."
+                    ),
+                    "audio_desc": "[Sound Effect] Dust cloth brushing metal.",
+                }
+            ]
+        }
+    )
+
+    STORYBOARD_1 = json.dumps(
+        {
+            "storyboard": [
+                {
+                    "idx": 0,
+                    "is_last": True,
+                    "cam_idx": 0,
+                    "visual_desc": (
+                        "Medium shot at eye level. <Bolt> stands on the right, "
+                        "facing the camera, holding up a blue canvas. "
+                        "The studio wall is softly out of focus behind it."
+                    ),
+                    "audio_desc": "[Speaker] Ana (happy): You did it, Bolt.",
+                }
+            ]
+        }
+    )
+
+    DECOMP_0 = json.dumps(
+        {
+            "ff_desc": (
+                "Wide shot of the studio at eye level. Ana (short dark hair, "
+                "paint-stained apron) stands on the left, facing right, one "
+                "hand on a dusty robot's shoulder."
+            ),
+            "ff_vis_char_idxs": [0],
+            "lf_desc": (
+                "Wide shot of the studio. Ana has stepped back from the robot, "
+                "still facing right, her hands at her sides."
+            ),
+            "lf_vis_char_idxs": [0],
+            "motion_desc": (
+                "Static camera. The woman in the paint-stained apron lifts her "
+                "hand from the robot and takes one step backwards."
+            ),
+            "variation_type": "small",
+            "variation_reason": "Only the character's pose changes within the same framing.",
+        }
+    )
+
+    DECOMP_1 = json.dumps(
+        {
+            "ff_desc": (
+                "Medium shot at eye level. Bolt (boxy rusted robot with amber "
+                "eyes) stands on the right facing the camera, canvas lowered."
+            ),
+            "ff_vis_char_idxs": [1],
+            "lf_desc": (
+                "Medium shot at eye level. Bolt holds the blue canvas up at "
+                "chest height, facing the camera, its amber eyes bright."
+            ),
+            "lf_vis_char_idxs": [1],
+            "motion_desc": (
+                "Static camera. The boxy rusted robot raises the canvas from "
+                "waist height to chest height."
+            ),
+            "variation_type": "medium",
+            "variation_reason": "The robot turns from the back to face the camera.",
+        }
+    )
+
+    #: Responses in the order the text stages ask for them.
+    TEXT_FLOW = [STORY, SCRIPT, CHARACTERS, STORYBOARD_0, STORYBOARD_1, DECOMP_0, DECOMP_1]
