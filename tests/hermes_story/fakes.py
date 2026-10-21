@@ -75,14 +75,23 @@ class FakeVideoGen:
 class FakeChat(FakeListChatModel):
     """A queued-response chat model usable with ``chat_model | parser``."""
 
-    #: Every message list handed to the model, oldest first.
+    #: The text of every prompt handed to the model, oldest first.
     calls: list = Field(default_factory=list)
 
     def __init__(self, responses: list[str] | None = None, **kwargs) -> None:
         super().__init__(responses=list(responses or ["ok"]), **kwargs)
 
+    def queue(self, response: str) -> None:
+        """Append ``response``; the next call returns it.
+
+        ``FakeListChatModel`` cycles back to the first response after the last
+        one, so point ``i`` at the newly queued reply.
+        """
+        self.responses.append(response)
+        self.i = len(self.responses) - 1
+
     def _call(self, messages, stop=None, run_manager=None, **kwargs):
-        self.calls.append(messages)
+        self.calls.append(_messages_text(messages))
         return super()._call(messages, stop=stop, run_manager=run_manager, **kwargs)
 
 
@@ -106,13 +115,13 @@ class FakeStageChat(FakeChat):
     def _call(self, messages, stop=None, run_manager=None, **kwargs):
         text = _messages_text(messages)
         if "camera_parent_items" in text:
-            self.calls.append(messages)
+            self.calls.append(text)
             return canned.CAMERA_TREE
         if "ref_image_indices" in text:
-            self.calls.append(messages)
+            self.calls.append(text)
             return canned.REFERENCE_SELECTION
         if "best_image_index" in text:
-            self.calls.append(messages)
+            self.calls.append(text)
             return canned.BEST_IMAGE
         return super()._call(messages, stop=stop, run_manager=run_manager, **kwargs)
 

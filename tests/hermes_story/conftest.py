@@ -80,3 +80,11 @@ def eng_after_frames(eng_after_sheets):
     _run(eng_after_sheets, "frames")
     _approve(eng_after_sheets.pid, "frames")
     return eng_after_sheets
+
+
+@pytest.fixture
+def eng_after_clips(eng_after_frames):
+    """``eng_after_frames`` plus generated and approved video clips."""
+    _run(eng_after_frames, "clips")
+    _approve(eng_after_frames.pid, "clips")
+    return eng_after_frames
