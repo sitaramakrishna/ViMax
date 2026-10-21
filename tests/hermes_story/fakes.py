@@ -103,6 +103,18 @@ def _messages_text(messages) -> str:
     return "\n".join(parts)
 
 
+class FakeFailChat(FakeChat):
+    """Raises ``message`` on every call, for the CLI redaction test."""
+
+    message: str = "fake failure"
+
+    def __init__(self, message: str = "fake failure", **kwargs) -> None:
+        super().__init__(responses=[], message=message, **kwargs)
+
+    def _call(self, messages, stop=None, run_manager=None, **kwargs):
+        raise RuntimeError(self.message)
+
+
 class FakeStageChat(FakeChat):
     """``FakeChat`` that recognises the image-stage prompts by their schema.
 

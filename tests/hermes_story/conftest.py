@@ -9,6 +9,11 @@ inspect or steer the calls the guarded generators make.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -17,13 +22,23 @@ from tests.hermes_story.fakes import FakeImageGen, FakeStageChat, FakeVideoGen, 
 
 PID = "20261021-0905-demo"
 
+REPO = Path(__file__).resolve().parents[2]
+
 OPTIONS = {
     "idea": "a robot learns to paint",
     "style": "warm watercolor",
     "shape": "16:9",
     "length_s": 16,
+    "duration_s": 8,
     "cap_usd": 10,
 }
+
+#: A camera tree for scene 0 with one child camera, so the frames estimate has
+#: to account for a transition video as well as the extra first frame.
+CAMERA_TREE_WITH_PARENT = [
+    {"idx": 0, "active_shot_idxs": [0], "parent_cam_idx": None, "parent_shot_idx": None},
+    {"idx": 1, "active_shot_idxs": [0], "parent_cam_idx": 0, "parent_shot_idx": 0},
+]
 
 
 def _approve(pid: str, stage: str) -> None:
@@ -37,9 +52,15 @@ def _run(engine_obj, stage: str) -> stages.StageResult:
 
 
 @pytest.fixture
-def eng_after_text(tmp_path, monkeypatch):
-    """Every text stage is approved; ``sheets`` is still pending."""
+def story_root(tmp_path, monkeypatch):
+    """An empty projects root shared by the CLI and the in-process fixtures."""
     monkeypatch.setenv("HERMES_STORY_ROOT", str(tmp_path))
+    return tmp_path
+
+
+@pytest.fixture
+def eng_after_text(story_root):
+    """Every text stage is approved; ``sheets`` is still pending."""
     project.create(PID, OPTIONS)
 
     chat = FakeStageChat(canned.TEXT_FLOW)
@@ -88,3 +109,72 @@ def eng_after_clips(eng_after_frames):
     _run(eng_after_frames, "clips")
     _approve(eng_after_frames.pid, "clips")
     return eng_after_frames
+
+
+@pytest.fixture
+def new_film(story_root):
+    """A project just created, with every stage still pending."""
+    project.create(PID, OPTIONS)
+    return PID
+
+
+@pytest.fixture
+def film_ready_for_sheets(eng_after_text):
+    """The id of a film whose earlier stages are approved and sheets pending."""
+    return eng_after_text.pid
+
+
+@pytest.fixture
+def clips_film(eng_after_clips):
+    """The id of a film with every stage, clips included, already produced."""
+    return eng_after_clips.pid
+
+
+@pytest.fixture
+def eng_for_estimate(eng_after_text):
+    """The canned film with prompts present and one child camera in scene 0."""
+    project.write_json(
+        eng_after_text.project_dir / "work" / "scene_0" / "camera_tree.json",
+        CAMERA_TREE_WITH_PARENT,
+    )
+    return eng_after_text
+
+
+@pytest.fixture
+def cli(story_root):
+    """Run ``python -m hermes_story`` in a subprocess with the fakes enabled.
+
+    ``cli(...)`` returns the parsed JSON line, ``cli.raw(...)`` the completed
+    process and ``cli.write(name, text)`` a path for ``--idea-file`` and
+    friends.  The fake providers only exist when ``PYTEST_CURRENT_TEST`` is set.
+    """
+
+    def raw(*argv, env=None):
+        child = dict(os.environ)
+        child.pop("OPENROUTER_API_KEY", None)
+        child["HERMES_STORY_ROOT"] = str(story_root)
+        child["HERMES_STORY_FAKE"] = "1"
+        child.setdefault("PYTEST_CURRENT_TEST", "tests/hermes_story/test_cli.py")
+        if env:
+            child.update(env)
+        return subprocess.run(
+            [sys.executable, "-m", "hermes_story", *map(str, argv)],
+            cwd=REPO,
+            env=child,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+
+    def call(*argv, env=None):
+        return json.loads(raw(*argv, env=env).stdout)
+
+    def write(name, text):
+        path = story_root / "cli-files" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    call.raw = raw
+    call.write = write
+    return call
