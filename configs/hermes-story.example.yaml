@@ -1,0 +1,12 @@
+# Copy to configs/hermes-story.yaml (gitignored) to override. The API key is read from OPENROUTER_API_KEY only.
+chat_model: google/gemma-4-31b-it
+image_model: google/gemini-2.5-flash-image
+video_model: google/veo-3.1-lite
+video_resolution: 720p
+video_duration_s: 8
+num_image_candidates: 2
+price_image_call: 0.04
+price_video_second: 0.03
+price_chat_call: 0.002
+default_cap_usd: 10.0
+base_url: https://openrouter.ai/api/v1
