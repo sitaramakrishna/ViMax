@@ -6,8 +6,10 @@ import sys
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
-from hermes_story import bible, project
+from hermes_story import bible, project, versions
+from tests.hermes_story.fakes import fake_log_has_reference
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -96,7 +98,7 @@ def test_approve_requires_review(cli, new_film):
 
 def test_estimate_reports_the_frames_formula(cli, film_ready_for_sheets):
     out = cli("estimate", film_ready_for_sheets, "sheets")
-    assert out["ok"] and out["cost"]["this_call_usd"] == pytest.approx(2 * 3 * 0.04)
+    assert out["ok"] and out["cost"]["this_call_usd"] == pytest.approx(2 * 3 * 0.06)
     every = cli("estimate", film_ready_for_sheets)
     assert set(every["estimates"]) == {
         "script",
@@ -185,3 +187,59 @@ def test_state_commands_respect_lock(cli, new_film):
     with project.lock(new_film):
         assert cli("cap", new_film, "5")["errors"][0].startswith("busy")
         assert cli("approve", new_film, "script")["errors"][0].startswith("busy")
+
+# -- restore / items / reference photos ---------------------------------
+
+def test_restore_clip_brings_back_v1(cli, film_with_clip_v2):
+    out = cli("restore", film_with_clip_v2, "clip:0.0", "1")
+    assert out["ok"] and out["items"][0]["item"] == "clip:0.0" and out["items"][0]["version"] == 3
+    # v2 was archived before being replaced
+    assert 2 in versions.list(film_with_clip_v2, "clip:0.0")
+
+def test_restore_refuses_shared_file_items(cli, film_with_clip_v2):
+    out = cli("restore", film_with_clip_v2, "char:Ana", "1")
+    assert out["errors"][0].startswith("bad_item")
+
+def test_restore_unknown_version(cli, film_with_clip_v2):
+    assert cli("restore", film_with_clip_v2, "clip:0.0", "9")["errors"][0].startswith("bad_item")
+
+def test_items_for_one_stage(cli, film_with_clip_v2):
+    out = cli("items", film_with_clip_v2, "clips")
+    assert [i["item"] for i in out["items"]] == ["clip:0.0", "clip:1.0"]
+    assert out["items"][0]["paths"]
+
+def test_items_all_stages(cli, film_with_clip_v2):
+    out = cli("items", film_with_clip_v2)
+    assert out["ok"] and {"story", "clip:1.0"} <= {i["item"] for i in out["items"]}
+
+def test_ref_add_becomes_front_reference(cli, film_ready_for_sheets, tmp_path):
+    img = tmp_path / "me.png"; Image.new("RGB", (8, 8)).save(img)
+    assert cli("ref-add", film_ready_for_sheets, "Ana", str(img), "--kind", "self")["ok"]
+    cli("run", film_ready_for_sheets, "sheets", "--approved-spend")
+    assert fake_log_has_reference(film_ready_for_sheets, "refs/")
+
+def test_ref_add_consented_needs_text(cli, film_ready_for_sheets, tmp_path):
+    img = tmp_path / "x.png"; Image.new("RGB", (8, 8)).save(img)
+    assert cli("ref-add", film_ready_for_sheets, "Ana", str(img), "--kind", "consented")["errors"][0].startswith("consent")
+
+def test_ref_add_rejects_non_image(cli, film_ready_for_sheets, tmp_path):
+    bad = tmp_path / "x.png"; bad.write_text("not an image")
+    assert cli("ref-add", film_ready_for_sheets, "Ana", str(bad), "--kind", "not_person")["errors"][0].startswith("bad_item")
+
+def test_ref_add_keeps_three_and_clear_empties(cli, film_ready_for_sheets, tmp_path):
+    img = tmp_path / "me.png"; Image.new("RGB", (8, 8)).save(img)
+    for _ in range(4):
+        out = cli("ref-add", film_ready_for_sheets, "Ana", str(img), "--kind", "self")
+        assert out["ok"], out["errors"]
+    assert len(out["refs"]) == 3
+    folder = project.path(film_ready_for_sheets) / "refs"
+    files = [p for p in folder.rglob("ref-*")]
+    assert len(files) == 3 and all((p.stat().st_mode & 0o777) == 0o600 for p in files)
+    assert (project.path(film_ready_for_sheets) / "versions").is_dir()
+    assert cli("ref-clear", film_ready_for_sheets, "Ana")["refs"] == []
+    assert not [p for p in folder.rglob("ref-*")]
+
+def test_ref_add_unknown_character(cli, film_ready_for_sheets, tmp_path):
+    img = tmp_path / "me.png"; Image.new("RGB", (8, 8)).save(img)
+    out = cli("ref-add", film_ready_for_sheets, "Nobody", str(img), "--kind", "self")
+    assert out["errors"][0].startswith("bad_item")

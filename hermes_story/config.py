@@ -29,7 +29,10 @@ class StoryConfig(BaseModel):
     video_resolution: str = "720p"
     video_duration_s: int = 8
     num_image_candidates: int = 2
+    sheet_image_model: str = "openai/gpt-image-2"
+    sheet_image_quality: str = "medium"
     price_image_call: float = 0.04
+    price_sheet_image_call: float = 0.06
     price_video_second: float = 0.03
     price_chat_call: float = 0.002
     default_cap_usd: float = 10.0

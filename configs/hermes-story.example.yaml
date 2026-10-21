@@ -5,7 +5,10 @@ video_model: google/veo-3.1-lite
 video_resolution: 720p
 video_duration_s: 8
 num_image_candidates: 2
+sheet_image_model: openai/gpt-image-2
+sheet_image_quality: medium
 price_image_call: 0.04
+price_sheet_image_call: 0.06
 price_video_second: 0.03
 price_chat_call: 0.002
 default_cap_usd: 10.0

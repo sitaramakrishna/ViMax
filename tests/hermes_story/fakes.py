@@ -17,8 +17,9 @@ from hermes_story import guarded
 class FakeImageGen:
     """Returns a tiny landscape PIL image and records every call."""
 
-    def __init__(self, raise_exc: BaseException | None = None) -> None:
+    def __init__(self, raise_exc: BaseException | None = None, log_path=None) -> None:
         self.raise_exc = raise_exc
+        self.log_path = log_path
         #: Optional ``(prompt, refs) -> bool`` hook to fail selected calls.
         self.fail_on = None
         self.calls: list[dict] = []
@@ -33,12 +34,31 @@ class FakeImageGen:
                 **kwargs,
             }
         )
+        if self.log_path is not None:
+            with open(self.log_path, "a", encoding="utf-8") as log:
+                log.write(json.dumps({"prompt": prompt, "refs": [str(r) for r in refs]}) + "\n")
         if self.fail_on is not None and self.fail_on(prompt, [str(ref) for ref in refs]):
             raise RuntimeError("fake image failure")
         if self.raise_exc is not None:
             raise self.raise_exc
         return ImageOutput(fmt="pil", ext="png", data=Image.new("RGB", (16, 9), (200, 30, 30)))
 
+
+def image_log_path(pid: str):
+    """Where subprocess fake image generators append one JSON line per call."""
+    from hermes_story import project
+
+    return project.path(pid) / "fake-image-log.jsonl"
+
+def fake_log_has_reference(pid: str, needle: str) -> bool:
+    """True when a logged fake image call used a reference path containing ``needle``."""
+    path = image_log_path(pid)
+    if not path.is_file():
+        return False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if any(needle in ref for ref in json.loads(line)["refs"]):
+            return True
+    return False
 
 class FakeVideoGen:
     """Returns an ``mp4`` byte output and records every call.

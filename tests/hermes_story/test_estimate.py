@@ -8,7 +8,7 @@ from hermes_story import estimate, project, state
 def test_canned_film_estimates(eng_for_estimate):
     cfg = eng_for_estimate.cfg
     pid = eng_for_estimate.pid
-    assert estimate.sheets(pid, cfg) == pytest.approx(2 * 3 * cfg.price_image_call)
+    assert estimate.sheets(pid, cfg) == pytest.approx(2 * 3 * cfg.price_sheet_image_call)
     assert estimate.clips(pid, cfg) == pytest.approx(
         2 * cfg.video_duration_s * cfg.price_video_second
     )
@@ -72,7 +72,7 @@ def test_item_estimate(eng_for_estimate):
     cfg = eng_for_estimate.cfg
     pid = eng_for_estimate.pid
     assert estimate.item_estimate(pid, "sheet:Ana", cfg) == pytest.approx(
-        3 * cfg.price_image_call
+        3 * cfg.price_sheet_image_call
     )
     assert estimate.item_estimate(pid, "frame:0.0", cfg) == pytest.approx(
         cfg.num_image_candidates * cfg.price_image_call

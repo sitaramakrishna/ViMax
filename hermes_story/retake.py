@@ -262,9 +262,8 @@ async def _retake_sheet(engine, parsed: items.Item, feedback: str):
     references: list[str] = []
     if front.is_file():
         references.append(str(front))
-    person = stages._cameo_of(engine, parsed.name)
-    if person is not None:
-        references.extend(str(photo) for photo in stages.cameo_photos(person))
+    photos, rule = stages._front_references(engine, parsed.name)
+    references.extend(str(photo) for photo in photos)
 
     features = (
         "(static) "
@@ -277,11 +276,13 @@ async def _retake_sheet(engine, parsed: items.Item, feedback: str):
         features=features,
         style=style,
     ).rstrip()
+    if rule:
+        prompt += "\n" + rule
     prompt += "\nRevision request: " + feedback
 
-    generator = CharacterPortraitsGenerator(image_generator=engine.image)
+    generator = CharacterPortraitsGenerator(image_generator=engine.sheet_image)
     with guarded.item(items.fmt(parsed)):
-        output = await engine.image.generate_single_image(
+        output = await engine.sheet_image.generate_single_image(
             prompt=prompt, reference_image_paths=references
         )
         output.save(str(front))

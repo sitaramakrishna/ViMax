@@ -102,7 +102,7 @@ def has_parent(camera: dict) -> bool:
 def sheets(pid: str, cfg) -> float:
     """One visible character needs three image calls (front, side, back)."""
     visible = [entry for entry in characters(pid) if entry.get("is_visible", True)]
-    return len(visible) * 3 * cfg.price_image_call
+    return len(visible) * 3 * cfg.price_sheet_image_call
 
 
 def frames(pid: str, cfg) -> float:
@@ -194,7 +194,7 @@ def item_estimate(pid: str, item: str, cfg) -> float:
     """Estimated cost of retaking one item."""
     kind = item_ids.parse(item).kind
     if kind == "sheet":
-        return 3 * cfg.price_image_call
+        return 3 * cfg.price_sheet_image_call
     if kind == "frame":
         return cfg.num_image_candidates * cfg.price_image_call
     if kind == "clip":

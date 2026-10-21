@@ -65,11 +65,15 @@ def eng_after_text(story_root):
 
     chat = FakeStageChat(canned.TEXT_FLOW)
     image = FakeImageGen()
+    sheet_image = FakeImageGen()
     video = FakeVideoGen()
-    eng = engine.Engine(PID, config.load(), chat=chat, image=image, video=video)
+    eng = engine.Engine(
+        PID, config.load(), chat=chat, image=image, sheet_image=sheet_image, video=video
+    )
     # Test-only hooks: the production engine exposes none of these.
     eng.chat_calls = lambda: chat.calls
     eng.image_inner = image
+    eng.sheet_image_inner = sheet_image
     eng.video_inner = video
 
     for stage in ("script", "characters"):
@@ -129,6 +133,21 @@ def clips_film(eng_after_clips):
     """The id of a film with every stage, clips included, already produced."""
     return eng_after_clips.pid
 
+
+@pytest.fixture
+def film_with_clip_v2(clips_film, cli):
+    """A finished film whose ``clip:0.0`` was retaken once (so v1 is archived).
+
+    The film is built in-process: the fake chat replays its canned replies from
+    the start in every subprocess, so a multi-stage film cannot be built by
+    separate CLI calls.
+    """
+    feedback = cli.write("feedback-v2.txt", "slower")
+    out = cli(
+        "retake", clips_film, "clip:0.0", "--feedback-file", feedback, "--approved-spend"
+    )
+    assert out["ok"], out["errors"]
+    return clips_film
 
 @pytest.fixture
 def eng_for_estimate(eng_after_text):

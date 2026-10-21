@@ -20,13 +20,14 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import types
 from pathlib import Path
 
 from hermes_story import bible, config, estimate, ledger, project, state
 from hermes_story import items as item_ids
-from hermes_story import retake, stages
+from hermes_story import retake, stages, versions
 
 #: Stable prefixes of the ``errors`` entries.
 TOKENS = (
@@ -42,6 +43,16 @@ TOKENS = (
 
 #: Largest cap accepted for one film, in USD.
 MAX_CAP_USD = 100.0
+
+#: Item kinds ``restore`` accepts (the others share one file with siblings).
+RESTORE_KINDS = ("story", "sheet", "prompt", "frame", "clip")
+
+#: Reference photo limits for ``ref-add``.
+REF_KINDS = ("self", "consented", "not_person")
+REF_MAX_PER_CHARACTER = 3
+REF_MAX_BYTES = 15 * 1024 * 1024
+CONSENT_MIN, CONSENT_MAX = 5, 500
+_MAGIC = ((b"\x89PNG\r\n\x1a\n", ".png"), (b"\xff\xd8\xff", ".jpg"))
 
 #: Item kinds whose retake spends money.
 PAID_ITEM_KINDS = ("sheet", "frame", "clip")
@@ -293,7 +304,7 @@ def _read_file(name: str, what: str) -> str:
 # -- engine --------------------------------------------------------------
 
 
-def _fake_providers():
+def _fake_providers(pid: str):
     """Test-only providers, behind ``HERMES_STORY_FAKE=1`` and pytest."""
     if os.environ.get("HERMES_STORY_FAKE") != "1":
         return None
@@ -307,13 +318,19 @@ def _fake_providers():
         if failure
         else fakes.FakeStageChat(fakes.canned.TEXT_FLOW)
     )
-    return {"chat": chat, "image": fakes.FakeImageGen(), "video": fakes.FakeVideoGen()}
+    log = fakes.image_log_path(pid)
+    return {
+        "chat": chat,
+        "image": fakes.FakeImageGen(log_path=log),
+        "sheet_image": fakes.FakeImageGen(log_path=log),
+        "video": fakes.FakeVideoGen(),
+    }
 
 
 def _engine(pid: str, cfg):
     from hermes_story.engine import Engine
 
-    return Engine(pid, cfg, **(_fake_providers() or {}))
+    return Engine(pid, cfg, **(_fake_providers(pid) or {}))
 
 
 # -- commands ------------------------------------------------------------
@@ -355,6 +372,195 @@ def cmd_status(args) -> dict:
         items=_items_for(args.id),
         extra={"item_statuses": _item_statuses(args.id)},
     )
+
+
+def cmd_items(args) -> dict:
+    cfg = config.load()
+    _require_project(args.id)
+    stage = _check_stage(args.stage) if args.stage else None
+    return _payload(
+        "items",
+        pid=args.id,
+        cfg=cfg,
+        stage=stage,
+        items=_items_for(args.id, stage),
+        extra={"item_statuses": _item_statuses(args.id)},
+    )
+
+
+def cmd_restore(args) -> dict:
+    cfg = config.load()
+    _require_project(args.id)
+    parsed = item_ids.parse(args.item)
+    item_id = item_ids.fmt(parsed)
+    if parsed.kind not in RESTORE_KINDS:
+        raise item_ids.ItemError(
+            f"{item_id} shares one file; retake it instead"
+        )
+    try:
+        number = int(args.version)
+    except (TypeError, ValueError):
+        raise item_ids.ItemError(f"version must be a whole number: {args.version!r}")
+    stage = item_ids.STAGE_OF[parsed.kind]
+
+    with project.lock(args.id):
+        if number < 1 or number not in versions.list(args.id, item_id):
+            raise item_ids.ItemError(f"no version {number} of {item_id}")
+        files = retake._files_by_pid(args.id, item_id)
+        if not files:
+            raise item_ids.ItemError(f"nothing to restore for {item_id!r}")
+
+        current = int(bible.load(args.id).get("current", {}).get(item_id, 1) or 1)
+        versions.archive(args.id, item_id, files)
+        # Put each file back in the folder where the item currently lives.
+        folders = {path.name: path.parent for path in files}
+        src_dir = project.safe_child(
+            project.path(args.id), "versions", item_ids.folder(parsed), f"v{number}"
+        )
+        for src in sorted(src_dir.iterdir()):
+            if src.is_file():
+                dest = folders.get(src.name, files[0].parent)
+                shutil.copy2(src, dest / src.name)
+        bible.add_revision(
+            args.id, item_id, f"[restore v{number}]", current, current + 1
+        )
+        state.set_item(args.id, item_id, "review")
+        state.set_stage(args.id, stage, "review")
+
+    rows = [row for row in _read_stage(args.id, stage) if row.get("item") == item_id]
+    if not rows:
+        rows = _item_rows(args.id, [item_id])
+    return _payload("restore", pid=args.id, cfg=cfg, stage=stage, items=rows)
+
+
+def _character_exists(pid: str, name: str) -> bool:
+    raw = project.read_json(project.path(pid) / "work" / "characters.json", None)
+    return isinstance(raw, list) and any(
+        isinstance(entry, dict) and entry.get("identifier_in_scene") == name
+        for entry in raw
+    )
+
+
+def _drop_refs(pid: str, parsed, files: list[Path]) -> None:
+    """Move reference photos into ``versions/`` (never deleted outright)."""
+    files = [path for path in files if path.is_file()]
+    if not files:
+        return
+    base = project.safe_child(
+        project.path(pid), "versions", f"refs-{item_ids.folder(parsed)}"
+    )
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    n = max(
+        (
+            int(m.group(1))
+            for child in base.iterdir()
+            if (m := versions.VERSION_RE.fullmatch(child.name))
+        ),
+        default=0,
+    ) + 1
+    dest = base / f"v{n}"
+    dest.mkdir(mode=0o700)
+    for path in files:
+        shutil.move(str(path), str(dest / path.name))
+
+
+def _ref_result(cmd: str, pid: str, cfg, name: str) -> dict:
+    refs = (bible.load(pid)["characters"].get(name) or {}).get("refs") or []
+    rows = [row for row in _read_stage(pid, "characters") if row["item"] == f"char:{name}"]
+    return _payload(
+        cmd,
+        pid=pid,
+        cfg=cfg,
+        stage="characters",
+        items=rows or _item_rows(pid, [f"char:{name}"]),
+        extra={"character": name, "refs": refs},
+    )
+
+
+def cmd_ref_add(args) -> dict:
+    cfg = config.load()
+    _require_project(args.id)
+    parsed = item_ids.parse(f"char:{args.character}")
+    name = parsed.name
+    consent = (args.consent or "").strip()
+    if args.kind == "consented" and not CONSENT_MIN <= len(consent) <= CONSENT_MAX:
+        raise stages.CameoError(
+            f"consent text of {CONSENT_MIN} to {CONSENT_MAX} characters is required "
+            "for --kind consented"
+        )
+
+    source = Path(args.path).expanduser()
+    try:
+        if not source.is_file():
+            raise OSError("not a file")
+        size = source.stat().st_size
+        if size > REF_MAX_BYTES:
+            raise item_ids.ItemError(f"reference photo is larger than 15 MB: {source}")
+        with source.open("rb") as handle:
+            head = handle.read(16)
+            data = head + handle.read()
+    except OSError as exc:
+        raise item_ids.ItemError(f"cannot read reference photo: {exc}")
+    ext = next((ext for magic, ext in _MAGIC if head.startswith(magic)), None)
+    if ext is None:
+        raise item_ids.ItemError("reference photo must be a JPEG or PNG image")
+    if len(data) > REF_MAX_BYTES:
+        raise item_ids.ItemError("reference photo is larger than 15 MB")
+
+    with project.lock(args.id):
+        if not _character_exists(args.id, name):
+            raise item_ids.ItemError(f"no character named {name!r}")
+        pdir = project.path(args.id)
+        (pdir / "refs").mkdir(mode=0o700, exist_ok=True)
+        folder = project.safe_child(pdir, "refs", item_ids.folder(parsed))
+        folder.mkdir(mode=0o700, exist_ok=True)
+
+        data_bible = bible.load(args.id)
+        entry = data_bible["characters"].setdefault(name, {})
+        refs = [r for r in (entry.get("refs") or []) if isinstance(r, dict)]
+        used = [
+            int(m.group(1))
+            for child in folder.iterdir()
+            if (m := re.fullmatch(r"ref-(\d+)\..+", child.name))
+        ]
+        n = max(used, default=0) + 1
+        target = folder / f"ref-{n}{ext}"
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+
+        refs.append(
+            {
+                "file": target.relative_to(pdir).as_posix(),
+                "kind": args.kind,
+                "consent": consent if args.kind == "consented" else None,
+                "at": datetime.datetime.now(datetime.UTC).isoformat(),
+            }
+        )
+        while len(refs) > REF_MAX_PER_CHARACTER:
+            oldest = refs.pop(0)
+            _drop_refs(args.id, parsed, [p for p in [stages.ref_path(pdir, oldest.get("file"))] if p])
+        entry["refs"] = refs
+        bible.save(args.id, data_bible)
+    return _ref_result("ref-add", args.id, cfg, name)
+
+
+def cmd_ref_clear(args) -> dict:
+    cfg = config.load()
+    _require_project(args.id)
+    parsed = item_ids.parse(f"char:{args.character}")
+    name = parsed.name
+    with project.lock(args.id):
+        if not _character_exists(args.id, name):
+            raise item_ids.ItemError(f"no character named {name!r}")
+        pdir = project.path(args.id)
+        data_bible = bible.load(args.id)
+        entry = data_bible["characters"].setdefault(name, {})
+        refs = [r for r in (entry.get("refs") or []) if isinstance(r, dict)]
+        _drop_refs(args.id, parsed, [p for p in (stages.ref_path(pdir, r.get("file")) for r in refs) if p])
+        entry["refs"] = []
+        bible.save(args.id, data_bible)
+    return _ref_result("ref-clear", args.id, cfg, name)
 
 
 def cmd_list(args) -> dict:
@@ -619,6 +825,10 @@ def cmd_msg_lookup(args) -> dict:
 HANDLERS = {
     "new": cmd_new,
     "status": cmd_status,
+    "items": cmd_items,
+    "restore": cmd_restore,
+    "ref-add": cmd_ref_add,
+    "ref-clear": cmd_ref_clear,
     "list": cmd_list,
     "estimate": cmd_estimate,
     "run": cmd_run,
@@ -669,6 +879,26 @@ def _parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="show one film's stages and items")
     status.add_argument("id")
+
+    items = sub.add_parser("items", help="show one stage's items with text and paths")
+    items.add_argument("id")
+    items.add_argument("stage", nargs="?", default=None)
+
+    restore = sub.add_parser("restore", help="bring back an earlier version of an item")
+    restore.add_argument("id")
+    restore.add_argument("item")
+    restore.add_argument("version")
+
+    ref_add = sub.add_parser("ref-add", help="add a reference photo for a character")
+    ref_add.add_argument("id")
+    ref_add.add_argument("character")
+    ref_add.add_argument("path")
+    ref_add.add_argument("--kind", required=True, choices=list(REF_KINDS))
+    ref_add.add_argument("--consent", default=None)
+
+    ref_clear = sub.add_parser("ref-clear", help="remove a character's reference photos")
+    ref_clear.add_argument("id")
+    ref_clear.add_argument("character")
 
     sub.add_parser("list", help="list every film")
 

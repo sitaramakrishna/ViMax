@@ -66,9 +66,9 @@ def test_edit_replaces_scene_text_and_rejects_media(eng_after_text):
 
 def test_sheet_retake_regenerates_three_views(eng_after_sheets):
     front = eng_after_sheets.project_dir / "work/character_portraits/0_Ana/front.png"
-    before = len(eng_after_sheets.image_inner.calls)
+    before = len(eng_after_sheets.sheet_image_inner.calls)
     r = asyncio.run(retake.retake(eng_after_sheets, "sheet:Ana", "curly hair"))
-    calls = eng_after_sheets.image_inner.calls[before:]
+    calls = eng_after_sheets.sheet_image_inner.calls[before:]
     assert r.items[0]["version"] == 2
     assert len(calls) == 3
     assert "Revision request: curly hair" in calls[0]["prompt"]

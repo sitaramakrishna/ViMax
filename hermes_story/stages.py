@@ -407,6 +407,47 @@ def _cameo_of(engine, name: str) -> str | None:
     return person if isinstance(person, str) and person.strip() else None
 
 
+LOOK_RULE = "Use the reference image for this character's look."
+
+IDENTITY_KINDS = ("self", "consented")
+
+def ref_path(project_dir: Path, rel) -> Path | None:
+    """The reference photo ``rel`` if it resolves inside ``<project>/refs/``, else None."""
+    try:
+        base = (Path(project_dir) / "refs").resolve()
+        path = (Path(project_dir) / str(rel)).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return path if path.is_relative_to(base) and path != base else None
+
+
+def _film_refs(engine, name: str) -> list[dict]:
+    entry = (bible.load(engine.pid).get("characters") or {}).get(name)
+    refs = entry.get("refs") if isinstance(entry, dict) else None
+    if not isinstance(refs, list):
+        return []
+    return [ref for ref in refs if isinstance(ref, dict) and ref.get("file")]
+
+def _front_references(engine, name: str) -> tuple[list[Path], str]:
+    """Reference photos for ``name``'s front view, and the rule to add."""
+    found: list[tuple[Path, str]] = []
+    for ref in _film_refs(engine, name):
+        path = ref_path(engine.project_dir, ref["file"])
+        if path is not None and path.is_file():
+            found.append((path, str(ref.get("kind") or "")))
+    if found:
+        if all(kind in IDENTITY_KINDS for _, kind in found):
+            return [path for path, _ in found], CAMEO_FRONT_RULE
+        return [path for path, _ in found], LOOK_RULE
+    person = _cameo_of(engine, name)
+    if person is not None:
+        return cameo_photos(person), CAMEO_FRONT_RULE
+    return [], ""
+
+def _front_reference_photos(engine, name: str) -> list[Path]:
+    """The film's reference photos, else the bound cameo's, else ``[]``."""
+    return _front_references(engine, name)[0]
+
 async def _front_portrait(
     engine,
     generator: CharacterPortraitsGenerator,
@@ -414,12 +455,11 @@ async def _front_portrait(
     style: str,
     path: Path,
 ) -> None:
-    """Generate the front view, using consented photos for a cameo person."""
-    person = _cameo_of(engine, character.identifier_in_scene)
-    if person is None:
+    """Generate the front view, using reference photos when there are any."""
+    photos, rule = _front_references(engine, character.identifier_in_scene)
+    if not photos:
         output = await generator.generate_front_portrait(character, style)
     else:
-        photos = cameo_photos(person)
         features = (
             "(static) "
             + (character.static_features or "")
@@ -431,18 +471,17 @@ async def _front_portrait(
             features=features,
             style=style,
         )
-        prompt = prompt.rstrip() + "\n" + CAMEO_FRONT_RULE
-        output = await engine.image.generate_single_image(
+        prompt = prompt.rstrip() + "\n" + rule
+        output = await engine.sheet_image.generate_single_image(
             prompt=prompt, reference_image_paths=[str(photo) for photo in photos]
         )
     output.save(str(path))
-
 
 async def _sheets(engine) -> list[dict]:
     data = bible.load(engine.pid)
     style = (data.get("options") or {}).get("style") or "cinematic"
     characters = _load_characters(engine)
-    generator = CharacterPortraitsGenerator(image_generator=engine.image)
+    generator = CharacterPortraitsGenerator(image_generator=engine.sheet_image)
     registry = _load_registry(engine)
     root = _work(engine) / "character_portraits"
     root.mkdir(parents=True, exist_ok=True)

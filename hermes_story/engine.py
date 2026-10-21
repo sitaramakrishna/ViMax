@@ -45,6 +45,7 @@ class Engine:
         *,
         chat=None,
         image=None,
+        sheet_image=None,
         video=None,
     ) -> None:
         self.pid = pid
@@ -58,6 +59,16 @@ class Engine:
             self.ledger,
             price=cfg.price_image_call,
             model=cfg.image_model,
+        )
+        # Character sheets use their own model.  An injected ``image`` stands in
+        # for it too when no separate ``sheet_image`` is given (tests).
+        if sheet_image is None:
+            sheet_image = image if image is not None else self._build_sheet_image()
+        self.sheet_image = guarded.GuardedImageGenerator(
+            sheet_image,
+            self.ledger,
+            price=cfg.price_sheet_image_call,
+            model=cfg.sheet_image_model,
         )
         self.video = guarded.GuardedVideoGenerator(
             video if video is not None else self._build_video(),
@@ -80,6 +91,13 @@ class Engine:
     def _build_image(self):
         return OpenRouterImage(
             api_key=self.cfg.api_key(), model=self.cfg.image_model
+        )
+
+    def _build_sheet_image(self):
+        return OpenRouterImage(
+            api_key=self.cfg.api_key(),
+            model=self.cfg.sheet_image_model,
+            quality=self.cfg.sheet_image_quality,
         )
 
     def _build_video(self):
