@@ -178,3 +178,10 @@ def cli(story_root):
     call.raw = raw
     call.write = write
     return call
+
+
+@pytest.fixture(autouse=True)
+def _example_config_only(monkeypatch):
+    """Tests never read the developer's local configs/hermes-story.yaml."""
+    from hermes_story import config as _config
+    monkeypatch.setenv("HERMES_STORY_CONFIG", str(_config.EXAMPLE_CONFIG))

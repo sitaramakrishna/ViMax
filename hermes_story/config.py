@@ -44,6 +44,8 @@ class StoryConfig(BaseModel):
 
 def load(path: str | None = None) -> StoryConfig:
     if path is None:
+        path = os.environ.get("HERMES_STORY_CONFIG") or None
+    if path is None:
         source = LOCAL_CONFIG if LOCAL_CONFIG.is_file() else EXAMPLE_CONFIG
     else:
         source = Path(path)

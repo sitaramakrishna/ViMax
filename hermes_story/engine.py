@@ -18,7 +18,7 @@ from hermes_story.config import StoryConfig
 from hermes_story.ledger import Ledger
 from pipelines.idea2video_pipeline import Idea2VideoPipeline
 from pipelines.script2video_pipeline import Script2VideoPipeline
-from tools.image_generator_openrouter_api import ImageGeneratorOpenRouterAPI
+from hermes_story.providers import OpenRouterImage
 from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
 
 
@@ -78,7 +78,7 @@ class Engine:
         )
 
     def _build_image(self):
-        return ImageGeneratorOpenRouterAPI(
+        return OpenRouterImage(
             api_key=self.cfg.api_key(), model=self.cfg.image_model
         )
 
