@@ -13,23 +13,29 @@ from interfaces.video_output import VideoOutput
 
 
 class FakeImageGen:
-    """Returns a tiny PIL image and records every call."""
+    """Returns a tiny landscape PIL image and records every call."""
 
     def __init__(self, raise_exc: BaseException | None = None) -> None:
         self.raise_exc = raise_exc
+        #: Optional ``(prompt, refs) -> bool`` hook to fail selected calls.
+        self.fail_on = None
         self.calls: list[dict] = []
 
     async def generate_single_image(self, prompt, reference_image_paths=None, **kwargs):
+        refs = list(reference_image_paths or [])
         self.calls.append(
             {
                 "prompt": prompt,
-                "reference_image_paths": list(reference_image_paths or []),
+                "reference_image_paths": refs,
+                "refs": [str(ref) for ref in refs],
                 **kwargs,
             }
         )
+        if self.fail_on is not None and self.fail_on(prompt, [str(ref) for ref in refs]):
+            raise RuntimeError("fake image failure")
         if self.raise_exc is not None:
             raise self.raise_exc
-        return ImageOutput(fmt="pil", ext="png", data=Image.new("RGB", (4, 4), (200, 30, 30)))
+        return ImageOutput(fmt="pil", ext="png", data=Image.new("RGB", (16, 9), (200, 30, 30)))
 
 
 class FakeVideoGen:
@@ -63,6 +69,37 @@ class FakeChat(FakeListChatModel):
 
     def _call(self, messages, stop=None, run_manager=None, **kwargs):
         self.calls.append(messages)
+        return super()._call(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+def _messages_text(messages) -> str:
+    parts = []
+    for message in messages:
+        content = getattr(message, "content", message)
+        parts.append(content if isinstance(content, str) else json.dumps(content))
+    return "\n".join(parts)
+
+
+class FakeStageChat(FakeChat):
+    """``FakeChat`` that recognises the image-stage prompts by their schema.
+
+    The frames stage asks for a camera tree, a reference selection and a best
+    candidate; which of the last two happens depends on how many image
+    candidates survive, so the reply is chosen from the prompt rather than a
+    fixed position in ``responses``.
+    """
+
+    def _call(self, messages, stop=None, run_manager=None, **kwargs):
+        text = _messages_text(messages)
+        if "camera_parent_items" in text:
+            self.calls.append(messages)
+            return canned.CAMERA_TREE
+        if "ref_image_indices" in text:
+            self.calls.append(messages)
+            return canned.REFERENCE_SELECTION
+        if "best_image_index" in text:
+            self.calls.append(messages)
+            return canned.BEST_IMAGE
         return super()._call(messages, stop=stop, run_manager=run_manager, **kwargs)
 
 
@@ -195,3 +232,19 @@ class canned:
 
     #: Responses in the order the text stages ask for them.
     TEXT_FLOW = [STORY, SCRIPT, CHARACTERS, STORYBOARD_0, STORYBOARD_1, DECOMP_0, DECOMP_1]
+
+    #: Camera tree, first-frame prompt and image choice for the frames stage.
+    CAMERA_TREE = json.dumps({"camera_parent_items": [None]})
+
+    #: Reference selection: keep the first (front portrait) reference.
+    REFERENCE_SELECTION = json.dumps(
+        {
+            "ref_image_indices": [0],
+            "text_prompt": "Keep the character's face from Image 0.",
+        }
+    )
+
+    #: The first candidate is always the winner.
+    BEST_IMAGE = json.dumps(
+        {"best_image_index": 0, "reason": "The first candidate is the most consistent."}
+    )

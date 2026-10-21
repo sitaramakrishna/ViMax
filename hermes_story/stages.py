@@ -1,4 +1,4 @@
-"""The text stages: script, characters, storyboard and prompts.
+"""The ViMax-backed stages: text, character sheets and first frames.
 
 Each paid-for ViMax call is guarded so the ledger can attribute it to an item,
 even though the text stages themselves only spend chat tokens.  ViMax's own
@@ -9,14 +9,28 @@ disk.
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agents.character_portraits_generator import (
+    CharacterPortraitsGenerator,
+    prompt_template_front,
+)
 from hermes_story import bible, guarded, project, state
 from hermes_story import items as item_ids
 from interfaces import CharacterInScene, ShotBriefDescription, ShotDescription
+from utils.text import safe_path_component
 
 DEFAULT_DURATION_S = 8
+
+#: Appended to the front-portrait prompt when a real person is the model.
+CAMEO_FRONT_RULE = "Keep the face and identity of the person in the reference photos."
+
+#: Photo extensions accepted from a cameo folder.
+CAMEO_PHOTO_EXTS = (".jpg", ".jpeg", ".png")
 
 #: Storyboard-only rule: dialogue is added later, so keep mouths out of frame.
 DIALOGUE_RULE = (
@@ -182,6 +196,117 @@ def _prompt_rows(engine) -> list[dict]:
     return rows
 
 
+def _registry_path(engine) -> Path:
+    return _work(engine) / "character_portraits_registry.json"
+
+
+def _load_registry(engine) -> dict:
+    """ViMax's ``character_portraits_registry.json``, or ``{}`` when absent."""
+    raw = project.read_json(_registry_path(engine), None)
+    return raw if isinstance(raw, dict) else {}
+
+
+def _sheet_rows(engine) -> list[dict]:
+    rows = []
+    for name, views in _load_registry(engine).items():
+        if not isinstance(views, dict):
+            continue
+        paths = []
+        for view in ("front", "side", "back"):
+            entry = views.get(view)
+            if isinstance(entry, dict) and entry.get("path"):
+                paths.append(Path(entry["path"]))
+        if not paths:
+            continue
+        row = _row(engine, f"sheet:{name}", "", paths=tuple(paths))
+        row["kind"] = "album"
+        rows.append(row)
+    return rows
+
+
+def _shot_indexes(engine, scene: int) -> list[int]:
+    raw = project.read_json(_storyboard_path(engine, scene), None)
+    if isinstance(raw, list):
+        return [ShotBriefDescription.model_validate(entry).idx for entry in raw]
+    shots_dir = _work(engine) / f"scene_{scene}" / "shots"
+    if not shots_dir.is_dir():
+        return []
+    return sorted(
+        int(child.name)
+        for child in shots_dir.iterdir()
+        if child.is_dir() and child.name.isdigit()
+    )
+
+
+def _frame_rows(engine, scene: int | None = None) -> list[dict]:
+    scenes = [scene] if scene is not None else _scene_indexes(engine)
+    rows = []
+    for i in scenes:
+        for j in _shot_indexes(engine, i):
+            folder = _work(engine) / f"scene_{i}" / "shots" / str(j)
+            first = folder / "first_frame.png"
+            if not first.is_file():
+                continue
+            paths = [first]
+            last = folder / "last_frame.png"
+            if last.is_file():
+                paths.append(last)
+            row = _row(engine, f"frame:{i}.{j}", "", paths=tuple(paths))
+            row["kind"] = "image"
+            rows.append(row)
+    return rows
+
+
+# -- cameo photos --------------------------------------------------------
+
+
+class CameoError(Exception):
+    """A cameo person has no usable consent or photos."""
+
+
+def cameo_photos(person: str) -> list[Path]:
+    """Photos of ``person`` from ``$HERMES_STORY_CAMEO_DIR/<person>/``.
+
+    The folder must be accompanied by a ``consent.json`` object; without one
+    the cameo fails closed.  At most three photos are returned, sorted by name.
+    """
+    base = os.environ.get("HERMES_STORY_CAMEO_DIR", "").strip()
+    if not base:
+        raise CameoError("HERMES_STORY_CAMEO_DIR is not set")
+    name = str(person or "").strip()
+    if (
+        not name
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or "\x00" in name
+    ):
+        raise CameoError(f"bad cameo person: {person!r}")
+    folder = Path(base).expanduser() / name
+    if not folder.is_dir():
+        raise CameoError(f"no cameo folder for {name!r}: {folder}")
+    consent = folder / "consent.json"
+    if not consent.is_file():
+        raise CameoError(f"no consent.json for cameo person {name!r}")
+    try:
+        payload = json.loads(consent.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CameoError(f"bad consent.json for cameo person {name!r}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise CameoError(f"bad consent.json for cameo person {name!r}: not an object")
+    photos = sorted(
+        (
+            child
+            for child in folder.iterdir()
+            if child.is_file() and child.suffix.lower() in CAMEO_PHOTO_EXTS
+        ),
+        key=lambda child: child.name,
+    )
+    if not photos:
+        raise CameoError(f"no photos for cameo person {name!r}")
+    return photos[:3]
+
+
 # -- stages --------------------------------------------------------------
 
 
@@ -252,18 +377,188 @@ async def _prompts(engine) -> list[dict]:
     return _prompt_rows(engine)
 
 
+def _cameo_of(engine, name: str) -> str | None:
+    entry = (bible.load(engine.pid).get("characters") or {}).get(name)
+    if not isinstance(entry, dict):
+        return None
+    person = entry.get("cameo")
+    return person if isinstance(person, str) and person.strip() else None
+
+
+async def _front_portrait(
+    engine,
+    generator: CharacterPortraitsGenerator,
+    character: CharacterInScene,
+    style: str,
+    path: Path,
+) -> None:
+    """Generate the front view, using consented photos for a cameo person."""
+    person = _cameo_of(engine, character.identifier_in_scene)
+    if person is None:
+        output = await generator.generate_front_portrait(character, style)
+    else:
+        photos = cameo_photos(person)
+        features = (
+            "(static) "
+            + (character.static_features or "")
+            + "; (dynamic) "
+            + (character.dynamic_features or "")
+        )
+        prompt = prompt_template_front.format(
+            identifier=character.identifier_in_scene,
+            features=features,
+            style=style,
+        )
+        prompt = prompt.rstrip() + "\n" + CAMEO_FRONT_RULE
+        output = await engine.image.generate_single_image(
+            prompt=prompt, reference_image_paths=[str(photo) for photo in photos]
+        )
+    output.save(str(path))
+
+
+async def _sheets(engine) -> list[dict]:
+    data = bible.load(engine.pid)
+    style = (data.get("options") or {}).get("style") or "cinematic"
+    characters = _load_characters(engine)
+    generator = CharacterPortraitsGenerator(image_generator=engine.image)
+    registry = _load_registry(engine)
+    root = _work(engine) / "character_portraits"
+    root.mkdir(parents=True, exist_ok=True)
+
+    rows: list[dict] = []
+    for character in characters:
+        if not character.is_visible:
+            continue
+        name = character.identifier_in_scene
+        folder = root / f"{character.idx}_{safe_path_component(name)}"
+        folder.mkdir(parents=True, exist_ok=True)
+        front_path = folder / "front.png"
+        side_path = folder / "side.png"
+        back_path = folder / "back.png"
+        errors: list[str] = []
+
+        with guarded.item(f"sheet:{name}"):
+            try:
+                if not front_path.is_file():
+                    await _front_portrait(engine, generator, character, style, front_path)
+            except Exception as exc:
+                errors.append(str(exc) or type(exc).__name__)
+
+            if front_path.is_file():
+                for path, view in ((side_path, "side"), (back_path, "back")):
+                    if path.is_file():
+                        continue
+                    try:
+                        if view == "side":
+                            output = await generator.generate_side_portrait(
+                                character, str(front_path)
+                            )
+                        else:
+                            output = await generator.generate_back_portrait(
+                                character, str(front_path)
+                            )
+                        output.save(str(path))
+                    except Exception as exc:
+                        errors.append(str(exc) or type(exc).__name__)
+
+        views = {}
+        for view, path in (
+            ("front", front_path),
+            ("side", side_path),
+            ("back", back_path),
+        ):
+            if path.is_file():
+                views[view] = {
+                    "path": str(path),
+                    "description": f"A {view} view portrait of {name}.",
+                }
+        if views:
+            registry[name] = views
+            project.write_json(_registry_path(engine), registry)
+
+        row = _row(
+            engine,
+            f"sheet:{name}",
+            "",
+            paths=tuple(
+                Path(views[view]["path"])
+                for view in ("front", "side", "back")
+                if view in views
+            ),
+        )
+        row["kind"] = "album"
+        if errors:
+            row["_error"] = "; ".join(errors)
+        rows.append(row)
+
+    project.write_json(_registry_path(engine), registry)
+    return rows
+
+
+async def _frames(engine) -> list[dict]:
+    characters = _load_characters(engine)
+    registry_file = _registry_path(engine)
+    if not registry_file.is_file():
+        raise FileNotFoundError("no character_portraits_registry.json in the project work dir")
+    registry = _load_registry(engine)
+    requirement = user_requirement(bible.load(engine.pid), "frames")
+
+    rows: list[dict] = []
+    for scene, text in enumerate(_load_script(engine)):
+        pipeline = engine.scene(scene)
+        storyboard = await pipeline.design_storyboard(
+            script=text,
+            characters=characters,
+            user_requirement=requirement,
+            quiet=True,
+        )
+        shot_descriptions = await pipeline.decompose_visual_descriptions(
+            shot_brief_descriptions=storyboard,
+            characters=characters,
+            quiet=True,
+        )
+        camera_tree = await pipeline.construct_camera_tree(
+            shot_descriptions=shot_descriptions, quiet=True
+        )
+        priority_shot_idxs = [
+            camera.parent_shot_idx
+            for camera in camera_tree
+            if camera.parent_shot_idx is not None
+        ]
+
+        async def run_camera(camera, _pipeline=pipeline, _scene=scene):
+            first = camera.active_shot_idxs[0] if camera.active_shot_idxs else 0
+            with guarded.item(f"frame:{_scene}.{first}"):
+                await _pipeline.generate_frames_for_single_camera(
+                    camera=camera,
+                    shot_descriptions=shot_descriptions,
+                    characters=characters,
+                    character_portraits_registry=registry,
+                    priority_shot_idxs=priority_shot_idxs,
+                )
+
+        # ViMax starts every camera at once; the ledger caps the spend.
+        await asyncio.gather(*(run_camera(camera) for camera in camera_tree))
+        rows.extend(_frame_rows(engine, scene))
+    return rows
+
+
 _STAGES = {
     "script": _script,
     "characters": _characters,
+    "sheets": _sheets,
     "storyboard": _storyboard,
     "prompts": _prompts,
+    "frames": _frames,
 }
 
 _READERS = {
     "script": _script_rows,
     "characters": _character_rows,
+    "sheets": _sheet_rows,
     "storyboard": _storyboard_rows,
     "prompts": _prompt_rows,
+    "frames": _frame_rows,
 }
 
 
@@ -285,11 +580,17 @@ def _stamp(pid: str, rows: list[dict], *, save: bool) -> None:
         bible.save(pid, data)
 
 
-def _finish(engine, stage: str, rows: list[dict]) -> None:
+def _finish(engine, stage: str, rows: list[dict]) -> list[str]:
+    """Stamp rows, set their item statuses and collect per-item errors."""
     _stamp(engine.pid, rows, save=True)
+    errors: list[str] = []
     for row in rows:
-        state.set_item(engine.pid, row["item"], "review")
+        error = row.pop("_error", None)
+        if error:
+            errors.append(error)
+        state.set_item(engine.pid, row["item"], "failed" if error else "review", error)
     state.set_stage(engine.pid, stage, "review")
+    return errors
 
 
 async def run_stage(engine, stage: str) -> StageResult:
@@ -314,5 +615,5 @@ async def run_stage(engine, stage: str) -> StageResult:
         state.set_stage(pid, stage, "failed", message)
         return StageResult(stage, [], engine.ledger.spent() - spent_before, [message])
 
-    _finish(engine, stage, rows)
-    return StageResult(stage, rows, engine.ledger.spent() - spent_before, [])
+    errors = _finish(engine, stage, rows)
+    return StageResult(stage, rows, engine.ledger.spent() - spent_before, errors)
